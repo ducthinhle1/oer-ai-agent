@@ -1,0 +1,29 @@
+# --- Secrets ---
+.env
+.env.local
+*.pem
+*.key
+
+# --- Python ---
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# --- macOS ---
+.DS_Store
+
+# --- App-generated data (do not commit) ---
+data/chroma/          # vector DB — rebuild via `python ingest.py`
+data/syllabi/*        # syllabi may contain student-facing material; keep local
+!data/syllabi/.gitkeep
+logs/queries.jsonl    # runtime log
+!logs/.gitkeep
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp

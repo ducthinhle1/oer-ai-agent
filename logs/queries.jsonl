@@ -1,0 +1,23 @@
+{"ts": "2026-04-27T18:35:06.171536+00:00", "type": "smoke.test", "note": "pipeline imports + logger works"}
+{"ts": "2026-04-27T18:42:05.021267+00:00", "type": "query.start", "course_code": "ARTS 1100", "course_title": "Art Appreciation"}
+{"ts": "2026-04-27T18:42:05.021678+00:00", "type": "syllabus.loaded", "course_code": "ARTS 1100", "chars": 0}
+{"ts": "2026-04-27T18:42:07.929046+00:00", "type": "search.query", "course_code": "ARTS 1100", "query": "Introduction to art appreciation"}
+{"ts": "2026-04-27T18:42:09.647101+00:00", "type": "search.results", "query": "Introduction to art appreciation", "count": 0}
+{"ts": "2026-04-27T18:42:09.647584+00:00", "type": "query.end", "course_code": "ARTS 1100", "evaluated": 0}
+{"ts": "2026-04-27T18:45:22.035682+00:00", "type": "query.start", "course_code": "ARTS 1100", "course_title": "Art Appreciation"}
+{"ts": "2026-04-27T18:45:22.037028+00:00", "type": "syllabus.loaded", "course_code": "ARTS 1100", "chars": 0}
+{"ts": "2026-04-27T18:45:26.614355+00:00", "type": "search.query", "course_code": "ARTS 1100", "query": "Introduction to Art Appreciation"}
+{"ts": "2026-04-27T18:45:27.296158+00:00", "type": "search.results", "query": "Introduction to Art Appreciation", "count": 0}
+{"ts": "2026-04-27T18:45:27.296878+00:00", "type": "query.end", "course_code": "ARTS 1100", "evaluated": 0}
+{"ts": "2026-04-27T19:06:17.907377+00:00", "type": "ingest.complete", "syllabi": 0, "open_alg": 98, "chunks": 98}
+{"ts": "2026-04-27T19:06:45.376707+00:00", "type": "ingest.complete", "syllabi": 0, "open_alg": 98, "chunks": 98}
+{"ts": "2026-04-27T19:06:48.929154+00:00", "type": "query.start", "course_code": "ARTS 1100", "course_title": "Art Appreciation"}
+{"ts": "2026-04-27T19:06:48.929757+00:00", "type": "syllabus.loaded", "course_code": "ARTS 1100", "chars": 0}
+{"ts": "2026-04-27T19:06:50.709337+00:00", "type": "search.query", "course_code": "ARTS 1100", "query": "Introduction to art appreciation"}
+{"ts": "2026-04-27T19:06:55.330705+00:00", "type": "retrieve.results", "query": "Introduction to art appreciation", "count": 5, "titles": ["Introduction to Art", "Music Appreciation", "Music Appreciation (Open Course)", "Theatre Appreciation (Open Course)", "Film Aesthetics (Open Course)"]}
+{"ts": "2026-04-27T19:07:49.463395+00:00", "type": "query.start", "course_code": "ARTS 1100", "course_title": "Art Appreciation"}
+{"ts": "2026-04-27T19:07:49.464740+00:00", "type": "syllabus.loaded", "course_code": "ARTS 1100", "chars": 0}
+{"ts": "2026-04-27T19:07:51.603799+00:00", "type": "search.query", "course_code": "ARTS 1100", "query": "Introduction art appreciation"}
+{"ts": "2026-04-27T19:07:53.237529+00:00", "type": "retrieve.results", "query": "Introduction art appreciation", "count": 5, "titles": ["Introduction to Art", "Music Appreciation", "Music Appreciation (Open Course)", "Film Aesthetics (Open Course)", "Theatre Appreciation (Open Course)"]}
+{"ts": "2026-04-27T19:08:11.672399+00:00", "type": "query.end", "course_code": "ARTS 1100", "evaluated": 5, "results": [{"title": "Introduction to Art", "url": "https://alg.manifoldapp.org/projects/introduction-to-art", "total": 0.0}, {"title": "Music Appreciation", "url": "https://alg.manifoldapp.org/projects/music-appreciation", "total": 0.0}, {"title": "Music Appreciation (Open Course)", "url": "https://alg.manifoldapp.org/projects/music-appreciation-open-course", "total": 0.0}, {"title": "Theatre Appreciation (Open Course)", "url": "https://alg.manifoldapp.org/projects/theatre-appreciation-open-course", "total": 0.0}, {"title": "Film Aesthetics (Open Course)", "url": "https://alg.manifoldapp.org/projects/film-aesthetics-open-course", "total": 0.0}]}
+{"ts": "2026-04-27T19:09:09.607181+00:00", "type": "query.end", "course_code": "ARTS 1100", "evaluated": 5, "results": [{"title": "Introduction to Art", "url": "https://alg.manifoldapp.org/projects/introduction-to-art", "total": 0.0}, {"title": "Music Appreciation", "url": "https://alg.manifoldapp.org/projects/music-appreciation", "total": 0.0}, {"title": "Music Appreciation (Open Course)", "url": "https://alg.manifoldapp.org/projects/music-appreciation-open-course", "total": 0.0}, {"title": "Film Aesthetics (Open Course)", "url": "https://alg.manifoldapp.org/projects/film-aesthetics-open-course", "total": 0.0}, {"title": "Theatre Appreciation (Open Course)", "url": "https://alg.manifoldapp.org/projects/theatre-appreciation-open-course", "total": 0.0}]}
