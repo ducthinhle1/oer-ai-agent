@@ -92,6 +92,24 @@ def _build_search_query(course_code: str, course_title: str, syllabus_text: str)
 # Sources that represent actual OER resources (not syllabus context)
 _OER_SOURCES = {"open_alg", "openstax"}
 
+# Words too generic to use as subject filters when deciding which title-search
+# results are worth merging into the main candidate pool.
+_TITLE_STOP_WORDS = {
+    "introduction", "intro", "to", "the", "a", "an", "and", "or", "of",
+    "in", "for", "with", "first", "second", "third", "semester", "course",
+    "open", "survey", "principles", "fundamentals", "concepts", "lab",
+    "i", "ii", "iii", "iv", "1", "2", "3", "4",
+}
+
+
+def _content_words(text: str) -> set[str]:
+    """Return lowercase non-stop words (≥3 chars) from a title string."""
+    import re as _re
+    return {
+        w for w in _re.split(r"\W+", text.lower())
+        if len(w) >= 3 and w not in _TITLE_STOP_WORDS
+    }
+
 
 @lru_cache(maxsize=1)
 def _get_reranker():
@@ -131,10 +149,21 @@ def _retrieve_candidates(query: str, *, top_k: int, course_title: str = "") -> l
     # Second search with the plain course title catches resources like
     # "Introduction to Art" that the refined query might rank below the fold.
     hits_title = store.similarity_search_with_score(course_title, k=top_k // 2) if course_title else []
+
+    # Filter title-search results: only keep chunks whose resource title shares
+    # at least one content word with the course title. This prevents loosely
+    # related subjects (e.g. English books) from sneaking in via semantic overlap
+    # on words like "appreciation" or "introduction".
+    course_words = _content_words(course_title)
+    filtered_title = [
+        (doc, dist) for doc, dist in hits_title
+        if course_words & _content_words(doc.metadata.get("title", ""))
+    ]
+
     # Merge — keep the best distance when a chunk appears in both searches.
     seen: dict[str, float] = {}
     merged = []
-    for doc, dist in hits_query + hits_title:
+    for doc, dist in hits_query + filtered_title:
         key = doc.page_content[:120]
         if key not in seen or dist < seen[key]:
             seen[key] = dist
