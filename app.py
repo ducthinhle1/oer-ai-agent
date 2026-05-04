@@ -9,9 +9,13 @@ populate ChromaDB. Then switch to **Search** and pick a course.
 """
 from __future__ import annotations
 
+import os
+# Must be set before chromadb is imported — fixes protobuf version conflict
+# between chromadb's opentelemetry dependency and google-genai on Streamlit Cloud.
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+
 import csv
 import io
-import os
 from pathlib import Path
 
 import pandas as pd
