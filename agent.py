@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 from typing import Optional
 
 from gemini_client import ask_gemini, ask_gemini_json, DEFAULT_MODEL, QUALITY_MODEL
@@ -26,7 +27,7 @@ from rubric import CRITERIA, SCORE_SCALE, empty_scores, rubric_prompt_block
 from sources.simple_syllabus import get_syllabus_text
 from vectorstore import get_vectorstore
 
-TOP_K = 12              # raw chunks pulled from Chroma
+TOP_K = 20              # raw chunks pulled from Chroma (higher gives re-ranker more to work with)
 MAX_CANDIDATES = 5      # how many distinct resources we evaluate with the LLM
 CTX_CHAR_BUDGET = 2500  # cap on retrieved context per candidate
 
@@ -40,6 +41,8 @@ class EvaluatedResource:
     scores: dict
     total: float
     integration_note: str
+    quality_summary: str = ""
+    source: str = ""          # "open_alg" or "openstax"
     retrieved_excerpt: str = ""
     raw: dict = field(default_factory=dict)
 
@@ -50,7 +53,9 @@ class EvaluatedResource:
             "url": self.url,
             "total": round(self.total, 2),
             "open_license": self.open_license,
+            "source": self.source,
             "integration": self.integration_note,
+            "quality_summary": self.quality_summary,
         }
         row.update({c.name: self.scores.get(c.name) for c in CRITERIA})
         return row
@@ -81,32 +86,64 @@ def _build_search_query(course_code: str, course_title: str, syllabus_text: str)
 
 
 # ---------------------------------------------------------------------------
-# Step 2 - RAG retrieval
+# Step 2 - RAG retrieval with cross-encoder re-ranking
 # ---------------------------------------------------------------------------
 
-def _retrieve_candidates(query: str, *, top_k: int) -> list[dict]:
-    """Vector-search Chroma, group chunks by source resource.
+# Sources that represent actual OER resources (not syllabus context)
+_OER_SOURCES = {"open_alg", "openstax"}
 
-    Returns a list of candidate dicts:
-        {title, url, license_hint, context, sources: [chunk_meta, ...]}
-    Only ``open_alg`` chunks become candidates — syllabus chunks act as
-    *query expansion* but aren't recommended back to the user.
+
+@lru_cache(maxsize=1)
+def _get_reranker():
+    """Load the cross-encoder model once and reuse it for every search.
+
+    What is a cross-encoder?
+      A regular embedding model reads one sentence at a time and turns it into
+      a vector. Similarity is then just a dot product — fast, but imprecise.
+
+      A cross-encoder reads the query AND the candidate together and outputs a
+      single relevance score. It "thinks" about both at the same time, so it
+      catches nuanced matches that pure vector similarity misses.
+
+    Model: ms-marco-MiniLM-L-6-v2 (~66 MB, downloads once on first use).
+    Trained on 500k real search queries — good at deciding "is this document
+    relevant to this question?"
+    """
+    from sentence_transformers import CrossEncoder
+    print("[agent] loading cross-encoder re-ranker (one-time, ~66 MB)…")
+    return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+
+def _retrieve_candidates(query: str, *, top_k: int) -> list[dict]:
+    """Vector-search Chroma, group chunks by resource, then re-rank.
+
+    Pipeline:
+      1. Fast vector search  → top_k chunks (broad recall)
+      2. Group by resource   → N distinct candidates
+      3. Cross-encoder       → re-score each candidate vs. the query
+      4. Return top MAX_CANDIDATES by re-rank score
+
+    Syllabus chunks are included in the vector search (they help pull relevant
+    OER resources to the surface) but are never returned as candidates.
     """
     store = get_vectorstore()
     # similarity_search_with_score returns (Document, distance) — lower is closer.
     hits = store.similarity_search_with_score(query, k=top_k)
 
     grouped: dict[str, dict] = defaultdict(lambda: {
-        "title": "", "url": "", "license_hint": "",
+        "title": "", "url": "", "license_hint": "", "source": "",
         "context_parts": [], "sources": [], "best_distance": 1e9,
     })
 
     for doc, dist in hits:
         meta = doc.metadata or {}
-        if meta.get("source") != "open_alg":
+        src = meta.get("source", "")
+        if src not in _OER_SOURCES:
             continue
-        pid = meta.get("project_id") or meta.get("url") or doc.page_content[:80]
+        # Use project_id for Open ALG, title for OpenStax (which has no project_id)
+        pid = meta.get("project_id") or meta.get("title") or doc.page_content[:80]
         bucket = grouped[pid]
+        bucket["source"] = bucket["source"] or src
         bucket["title"] = bucket["title"] or meta.get("title", "")
         bucket["url"] = bucket["url"] or meta.get("url", "")
         bucket["license_hint"] = bucket["license_hint"] or meta.get("license_hint", "")
@@ -122,55 +159,135 @@ def _retrieve_candidates(query: str, *, top_k: int) -> list[dict]:
             "title": b["title"] or "(untitled)",
             "url": b["url"],
             "license_hint": b["license_hint"],
+            "source": b["source"],
             "context": ctx,
             "best_distance": b["best_distance"],
             "sources": b["sources"],
         })
 
-    candidates.sort(key=lambda c: c["best_distance"])
+    # Re-rank: the cross-encoder reads the query + each candidate's title and
+    # context together, producing a score that reflects true relevance.
+    if len(candidates) > 1:
+        reranker = _get_reranker()
+        pairs = [
+            (query, f"{c['title']}\n{c['context']}")
+            for c in candidates
+        ]
+        scores = reranker.predict(pairs)
+        for c, score in zip(candidates, scores):
+            c["rerank_score"] = float(score)
+        candidates.sort(key=lambda c: c["rerank_score"], reverse=True)
+    else:
+        # Only one candidate — no re-ranking needed
+        for c in candidates:
+            c["rerank_score"] = 0.0
+
     return candidates[:MAX_CANDIDATES]
 
 
 # ---------------------------------------------------------------------------
-# Step 3 - per-resource evaluation, grounded in retrieved context
+# Step 3 - batch evaluation — all candidates in one Gemini call
 # ---------------------------------------------------------------------------
 
 _EVAL_SYSTEM = (
-    "You are an OER evaluator. You receive a course description and a candidate "
-    "open educational resource, plus retrieved context about that resource. "
+    "You are an OER evaluator. You receive a course description and one or more candidate "
+    "open educational resources, each with retrieved context. "
     "Base your judgment ONLY on the retrieved context — if the context does not "
     "support a score, return null for that score and say so in license_note. "
     "Respond with valid JSON only — no prose, no markdown fences."
 )
 
 
-def _evaluate_one(course_code: str, course_title: str, candidate: dict) -> EvaluatedResource:
+def _make_resource(candidate: dict, item: dict) -> EvaluatedResource:
+    """Build an EvaluatedResource from a candidate dict and a parsed Gemini response item."""
+    scores_raw = item.get("scores") or {}
+    scores = {c.name: _coerce_int(scores_raw.get(c.name)) for c in CRITERIA}
+    numeric = [v for v in scores.values() if isinstance(v, int)]
+    total = sum(numeric) / len(numeric) if numeric else 0.0
+    return EvaluatedResource(
+        title=candidate.get("title", "(untitled)"),
+        url=candidate.get("url", ""),
+        open_license=item.get("open_license"),
+        license_note=str(item.get("license_note", "")).strip(),
+        scores=scores,
+        total=total,
+        quality_summary=str(item.get("quality_summary", "")).strip(),
+        source=candidate.get("source", ""),
+        integration_note=str(item.get("integration_note", "")).strip(),
+        retrieved_excerpt=candidate.get("context", "")[:500],
+        raw=candidate,
+    )
+
+
+def _make_error_resource(candidate: dict, raw_msg: str) -> EvaluatedResource:
+    if "quota" in raw_msg.lower() or "429" in raw_msg:
+        note = "⚠ API quota limit reached while evaluating this resource. Try the search again in a minute."
+    else:
+        note = "⚠ Could not evaluate this resource. Try the search again."
+    return EvaluatedResource(
+        title=candidate.get("title", "(untitled)"),
+        url=candidate.get("url", ""),
+        open_license=None,
+        license_note=note,
+        scores=empty_scores(),
+        total=0.0,
+        quality_summary="",
+        source=candidate.get("source", ""),
+        integration_note="",
+        retrieved_excerpt=candidate.get("context", "")[:500],
+        raw=candidate,
+    )
+
+
+def _evaluate_all(
+    course_code: str, course_title: str, candidates: list[dict]
+) -> list[EvaluatedResource]:
+    """Evaluate all candidates in a single Gemini call — 1 API call instead of N.
+
+    Sends all candidates together in one prompt and asks for a JSON array of results.
+    This eliminates the burst quota problem that came from N sequential calls with sleeps.
+    """
+    if not candidates:
+        return []
+
     rubric_text = rubric_prompt_block()
     score_keys = ", ".join(f'"{c.name}"' for c in CRITERIA)
     score_min, score_max = SCORE_SCALE
 
+    cands_block = "\n\n".join(
+        f"--- CANDIDATE {i + 1} ---\n"
+        f"title: {c.get('title')}\n"
+        f"url: {c.get('url')}\n"
+        f"license_hint: {c.get('license_hint')}\n"
+        f"context:\n\"\"\"\n{c.get('context')}\n\"\"\""
+        for i, c in enumerate(candidates)
+    )
+
     prompt = f"""Course: {course_code} - {course_title}
 
-Candidate resource:
-  title: {candidate.get('title')}
-  url: {candidate.get('url')}
-  license_hint: {candidate.get('license_hint')}
-
-Retrieved context (excerpts from the actual resource record):
-\"\"\"
-{candidate.get('context')}
-\"\"\"
+{cands_block}
 
 {rubric_text}
 
-Return strictly this JSON shape:
+Evaluate EACH of the {len(candidates)} candidates above. Return a JSON object with a single key "results" containing an array of exactly {len(candidates)} objects, one per candidate in order:
 {{
-  "open_license": true | false | null,
-  "license_note": "<one short sentence justifying the license verdict>",
-  "scores": {{ {score_keys} }},   // each value an integer {score_min}-{score_max}, or null if context doesn't support a score
-  "integration_note": "<two sentences for the instructor on how to use this resource>"
+  "results": [
+    {{
+      "open_license": true | false | null,
+      "license_note": "<one short sentence justifying the license verdict>",
+      "scores": {{ {score_keys} }},
+      "quality_summary": "<3-4 sentence narrative: coverage, alignment, strengths, gaps>",
+      "integration_note": "<3-4 sentences for the instructor: topics addressed, primary vs supplement, assignment idea, what needs supplementation>"
+    }}
+  ]
 }}
+
+Scoring rules — every criterion MUST receive an integer {score_min}-{score_max}:
+- Score what you can directly from the retrieved context.
+- For criteria not directly evidenced, make a calibrated estimate: resources on curated OER platforms (Open ALG, OpenStax) published under open licenses can reasonably be assumed to meet baseline standards for accessibility, usability, and accuracy — score those at {(score_min + score_max) // 2} unless context suggests otherwise.
+- Use null ONLY as a last resort when there is genuinely zero signal for a criterion.
 """
+
     data = ask_gemini_json(
         prompt,
         system_instruction=_EVAL_SYSTEM,
@@ -179,34 +296,28 @@ Return strictly this JSON shape:
     )
 
     if data.get("_parse_error"):
-        return EvaluatedResource(
-            title=candidate.get("title", "(untitled)"),
-            url=candidate.get("url", ""),
-            open_license=None,
-            license_note="Could not parse evaluator response.",
-            scores=empty_scores(),
-            total=0.0,
-            integration_note=(data.get("raw") or "")[:300],
-            retrieved_excerpt=candidate.get("context", "")[:500],
-            raw=candidate,
-        )
+        raw_msg = data.get("raw") or ""
+        log_event("eval.parse_error", {"raw_preview": raw_msg[:300]})
+        return [_make_error_resource(c, raw_msg) for c in candidates]
 
-    scores_raw = data.get("scores") or {}
-    scores = {c.name: _coerce_int(scores_raw.get(c.name)) for c in CRITERIA}
-    numeric = [v for v in scores.values() if isinstance(v, int)]
-    total = sum(numeric) / len(numeric) if numeric else 0.0
+    results_raw = data.get("results")
+    if not isinstance(results_raw, list):
+        log_event("eval.parse_error", {"raw_preview": str(data)[:300]})
+        return [_make_error_resource(c, str(data)) for c in candidates]
 
-    return EvaluatedResource(
-        title=candidate.get("title", "(untitled)"),
-        url=candidate.get("url", ""),
-        open_license=data.get("open_license"),
-        license_note=str(data.get("license_note", "")).strip(),
-        scores=scores,
-        total=total,
-        integration_note=str(data.get("integration_note", "")).strip(),
-        retrieved_excerpt=candidate.get("context", "")[:500],
-        raw=candidate,
-    )
+    evaluated = []
+    for i, c in enumerate(candidates):
+        if i < len(results_raw) and isinstance(results_raw[i], dict):
+            r = _make_resource(c, results_raw[i])
+            if r.total == 0.0:
+                log_event("eval.zero_score", {
+                    "title": c.get("title"),
+                    "scores": results_raw[i].get("scores"),
+                })
+            evaluated.append(r)
+        else:
+            evaluated.append(_make_error_resource(c, "incomplete response"))
+    return evaluated
 
 
 def _coerce_int(v) -> Optional[int]:
@@ -229,7 +340,7 @@ def run_agent(
     syllabus_url: Optional[str] = None,
     max_candidates: int = MAX_CANDIDATES,
     top_k: int = TOP_K,
-) -> list[EvaluatedResource]:
+) -> tuple[list[EvaluatedResource], str]:
     """Run the full RAG pipeline for one course."""
     log_event("query.start", {"course_code": course_code, "course_title": course_title})
 
@@ -248,18 +359,21 @@ def run_agent(
 
     if not candidates:
         log_event("query.end", {"course_code": course_code, "evaluated": 0})
-        return []
+        return [], query
 
     candidates = candidates[:max_candidates]
-    evaluated = [_evaluate_one(course_code, course_title, c) for c in candidates]
+
+    evaluated = _evaluate_all(course_code, course_title, candidates)
+
     evaluated.sort(key=lambda r: r.total, reverse=True)
 
     log_event("query.end", {
         "course_code": course_code,
+        "query": query,
         "evaluated": len(evaluated),
         "results": [{"title": r.title, "url": r.url, "total": r.total} for r in evaluated],
     })
-    return evaluated
+    return evaluated, query
 
 
 def evaluated_to_json(results: list[EvaluatedResource]) -> str:

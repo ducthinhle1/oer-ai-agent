@@ -27,14 +27,29 @@ from bs4 import BeautifulSoup
 SYLLABI_DIR = Path(__file__).resolve().parent.parent / "data" / "syllabi"
 
 
+_TEXT_SUFFIXES = {".txt", ".md", ".html", ".htm"}
+
+
 def _read_local_syllabus(course_code: str) -> Optional[str]:
-    """Return text from data/syllabi/<course_code>.* if present."""
+    """Return text from data/syllabi/<course_code>.* if present.
+
+    Prefers plain-text formats (.txt/.md/.html) over other files (e.g. PDFs
+    that cannot be read as text), so that a .txt extract always wins over a
+    same-named PDF.
+    """
     if not SYLLABI_DIR.exists():
         return None
-    needle = course_code.lower().replace(" ", "")
-    for path in SYLLABI_DIR.iterdir():
-        if needle in path.stem.lower().replace(" ", ""):
-            return path.read_text(encoding="utf-8", errors="ignore")
+    needle = course_code.lower().replace(" ", "").replace("_", "")
+    candidates = [
+        p for p in SYLLABI_DIR.iterdir()
+        if needle in p.stem.lower().replace(" ", "").replace("_", "")
+    ]
+    # Sort: readable text files first, everything else last
+    candidates.sort(key=lambda p: (p.suffix.lower() not in _TEXT_SUFFIXES,))
+    for path in candidates:
+        if path.suffix.lower() not in _TEXT_SUFFIXES:
+            continue  # skip non-text files (e.g. PDF)
+        return path.read_text(encoding="utf-8", errors="ignore")
     return None
 
 
@@ -50,6 +65,40 @@ def _fetch_url(url: str) -> Optional[str]:
     for tag in soup(["script", "style", "nav", "footer"]):
         tag.decompose()
     return soup.get_text("\n", strip=True)
+
+
+def get_local_syllabus_path(course_code: str) -> Optional[Path]:
+    """Return the Path of the matching readable syllabus file, or None.
+
+    Only returns text-readable formats (.txt/.md/.html). PDFs are excluded
+    because they cannot be read as plain text.
+    """
+    if not SYLLABI_DIR.exists():
+        return None
+    needle = course_code.lower().replace(" ", "").replace("_", "")
+    for path in SYLLABI_DIR.iterdir():
+        if path.suffix.lower() not in _TEXT_SUFFIXES:
+            continue
+        if needle in path.stem.lower().replace(" ", "").replace("_", ""):
+            return path
+    return None
+
+
+def get_local_pdf_path(course_code: str) -> Optional[Path]:
+    """Return the Path of a matching PDF syllabus file, or None."""
+    if not SYLLABI_DIR.exists():
+        return None
+    needle = course_code.lower().replace(" ", "").replace("_", "")
+    for path in SYLLABI_DIR.iterdir():
+        if path.suffix.lower() == ".pdf":
+            if needle in path.stem.lower().replace(" ", "").replace("_", ""):
+                return path
+    return None
+
+
+def has_local_syllabus(course_code: str) -> bool:
+    """Return True if a local syllabus file exists for this course code."""
+    return get_local_syllabus_path(course_code) is not None
 
 
 def get_syllabus_text(course_code: str, *, url: Optional[str] = None) -> str:

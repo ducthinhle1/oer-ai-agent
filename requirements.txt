@@ -1,8 +1,8 @@
 # --- UI ---
 streamlit>=1.30
 
-# --- LLM (direct Gemini SDK + LangChain integration) ---
-google-generativeai>=0.7
+# --- LLM (Gemini SDK + LangChain integration) ---
+google-genai>=1.0
 langchain>=0.3
 langchain-core>=0.3
 langchain-text-splitters>=0.3
@@ -20,3 +20,10 @@ python-dotenv>=1.0
 requests>=2.31
 beautifulsoup4>=4.12
 lxml>=5.0
+
+# --- PDF support (syllabus ingestion) ---
+pypdf>=4.0
+
+# --- Optional: full syllabus scraping from GGC SimpleSyllabus ---
+# Uncomment + run `playwright install chromium` to enable full-text fetch.
+# playwright>=1.40

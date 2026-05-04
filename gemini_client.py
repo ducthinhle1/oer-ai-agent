@@ -1,84 +1,113 @@
 """
-Thin wrapper around the Google Gemini API.
+Thin wrapper around google-genai (the current Gemini SDK) for the OER agent.
 
-Why a wrapper?
-- Centralises the model name + retry logic in one place.
-- Lets us swap models or providers later without touching app code.
+Two entry points:
+  ask_gemini      — plain-text response (used for query refinement)
+  ask_gemini_json — JSON-parsed response (used for rubric evaluation)
+
+Model constants let callers pick the right power/cost trade-off without
+knowing internal model IDs.
 """
 from __future__ import annotations
 
 import json
+import re
 import time
-from typing import Optional
+from typing import Any
 
-import google.generativeai as genai
-from google.api_core import exceptions
+from google import genai
+from google.genai import types
 
-# Default model. Use the lighter "flash" by default for cheaper / faster calls.
-# Switch to "gemini-2.5-pro" for the rubric-evaluation step where quality matters.
-DEFAULT_MODEL = "gemini-2.5-flash"
-QUALITY_MODEL = "gemini-2.5-pro"
+DEFAULT_MODEL = "gemini-2.0-flash"   # fast, free tier: 1500 RPD / 15 RPM
+QUALITY_MODEL = "gemini-2.0-flash"   # rubric evaluation — same model, 3× more daily quota than 2.5-flash
+
+_client: genai.Client | None = None
 
 
 def initialize_gemini(api_key: str) -> None:
-    """Configure the Gemini SDK with your API key. Call once at app start."""
-    if not api_key:
-        raise ValueError("GOOGLE_API_KEY is missing. Copy .env.example -> .env and fill it in.")
-    genai.configure(api_key=api_key)
+    """Call once at app startup to configure the API key."""
+    global _client
+    _client = genai.Client(api_key=api_key)
+
+
+def _get_client() -> genai.Client:
+    if _client is None:
+        raise RuntimeError("Call initialize_gemini(api_key) before using ask_gemini.")
+    return _client
+
+
+def _thinking_cfg(model_name: str) -> dict:
+    """ThinkingConfig is only valid for Gemini 2.5+; older models reject it."""
+    if "2.5" in model_name:
+        return {"thinking_config": types.ThinkingConfig(thinking_budget=0)}
+    return {}
 
 
 def ask_gemini(
     prompt: str,
     *,
+    system_instruction: str = "",
     model_name: str = DEFAULT_MODEL,
-    system_instruction: Optional[str] = None,
-    temperature: float = 0.2,
-    max_retries: int = 3,
 ) -> str:
-    """Send a text prompt to Gemini and return the text response.
-
-    Retries on rate-limit errors with exponential backoff.
-    """
-    model = genai.GenerativeModel(
-        model_name,
-        system_instruction=system_instruction,
-        generation_config={"temperature": temperature},
-    )
-
-    wait = 5
-    for attempt in range(max_retries):
-        try:
-            resp = model.generate_content(prompt)
-            return (resp.text or "").strip()
-        except exceptions.ResourceExhausted:
-            if attempt == max_retries - 1:
-                return "Error: Gemini quota exceeded. Try again in a minute."
-            time.sleep(wait)
-            wait *= 2
-        except Exception as e:  # noqa: BLE001 - surface anything else verbatim
-            if "429" in str(e) and attempt < max_retries - 1:
-                time.sleep(wait)
-                wait *= 2
-                continue
-            return f"Error: {e}"
-    return "Error: unknown failure"
-
-
-def ask_gemini_json(prompt: str, **kwargs) -> dict:
-    """Same as ask_gemini, but parses the response as JSON.
-
-    The model is asked (via prompt convention) to return only JSON. We strip
-    common code-fence wrappers before parsing so it survives ``` blocks.
-    """
-    raw = ask_gemini(prompt, **kwargs)
-    cleaned = raw.strip()
-    if cleaned.startswith("```"):
-        # remove ```json ... ``` or ``` ... ```
-        cleaned = cleaned.strip("`")
-        if cleaned.lower().startswith("json"):
-            cleaned = cleaned[4:]
-        cleaned = cleaned.strip()
+    """Send a plain-text prompt and return the response text."""
     try:
-        return json.loads(cleaned)
+        cfg = types.GenerateContentConfig(
+            system_instruction=system_instruction or None,
+            **_thinking_cfg(model_name),
+        )
+        response = _get_client().models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config=cfg,
+        )
+        return response.text or ""
+    except Exception as e:
+        return f"Error: {e}"
+
+
+def ask_gemini_json(
+    prompt: str,
+    *,
+    system_instruction: str = "",
+    model_name: str = QUALITY_MODEL,
+    temperature: float = 0.0,
+) -> dict[str, Any]:
+    """Send a prompt expecting JSON back and return a parsed dict.
+
+    Strips markdown code fences if the model wraps the JSON in them.
+    On parse failure, returns {"_parse_error": True, "raw": <raw_text>}.
+    """
+    cfg = types.GenerateContentConfig(
+        system_instruction=system_instruction or None,
+        temperature=temperature,
+        response_mime_type="application/json",
+        **_thinking_cfg(model_name),
+    )
+    text = ""
+    for attempt in range(3):
+        try:
+            response = _get_client().models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=cfg,
+            )
+            text = (response.text or "").strip()
+            break
+        except Exception as e:
+            err = str(e)
+            is_quota = "429" in err or "quota" in err.lower()
+            if is_quota and attempt < 2:
+                time.sleep(30 * (attempt + 1))  # 30s, then 60s
+                continue
+            if is_quota:
+                return {"_parse_error": True, "raw": "API quota exceeded — try again in a moment."}
+            return {"_parse_error": True, "raw": err}
+
+    # Safety net: strip ``` fences in case they appear despite response_mime_type
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text)
+
+    try:
+        return json.loads(text)
     except json.JSONDecodeError:
-        return {"_parse_error": True, "raw": raw}
+        return {"_parse_error": True, "raw": text}

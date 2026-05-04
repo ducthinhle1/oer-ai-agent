@@ -7,11 +7,12 @@ Run this once (or whenever sources change):
 
 What it does:
   1. Loads every syllabus file in ``data/syllabi/`` (.txt / .md / .html).
-  2. Pulls the catalog from Open ALG (alg.manifoldapp.org) via the public API.
-  3. Splits each document into ~500-char chunks with 50-char overlap.
-  4. Embeds each chunk with Sentence Transformers (local, free).
-  5. Writes everything to ChromaDB at ``data/chroma/`` with metadata
-     (``source``, ``course_code`` for syllabi, ``url``, ``license_hint`` for ALG).
+  2. Fetches all projects from Open ALG (alg.manifoldapp.org) via paginated API.
+  3. Fetches all books from OpenStax (openstax.org) — 127 peer-reviewed OER texts.
+  4. Splits each document into ~500-char chunks with 50-char overlap.
+  5. Embeds each chunk with Sentence Transformers (local, free).
+  6. Writes everything to ChromaDB at ``data/chroma/`` with metadata
+     (``source``, ``course_code`` for syllabi, ``url``, ``license_hint`` for ALG/OpenStax).
 
 Idempotent: documents are upserted by a stable ``id`` so re-running won't
 duplicate. Re-running picks up new/changed files automatically.
@@ -28,8 +29,8 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from logger import log_event
-from sources.open_alg import search_open_alg
-from sources.simple_syllabus import REQUIRED_COURSES
+from sources.open_alg import fetch_all_projects
+from sources.openstax import fetch_all_books
 from vectorstore import get_vectorstore
 
 # ---------------------------------------------------------------------------
@@ -40,7 +41,7 @@ CHUNK_SIZE = 500
 CHUNK_OVERLAP = 50
 
 SYLLABI_DIR = Path(__file__).resolve().parent / "data" / "syllabi"
-SUPPORTED_SUFFIXES = {".txt", ".md", ".html", ".htm"}
+SUPPORTED_SUFFIXES = {".txt", ".md", ".html", ".htm", ".pdf"}
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +61,18 @@ def _detect_course_code(filename: str, text: str) -> str:
     return f"{m.group(1)} {m.group(2)}"
 
 
+def _read_file(path: Path) -> str:
+    if path.suffix.lower() == ".pdf":
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(str(path))
+            return "\n".join(pg.extract_text() or "" for pg in reader.pages).strip()
+        except Exception as e:
+            print(f"[ingest] PDF read error {path.name}: {e}")
+            return ""
+    return path.read_text(encoding="utf-8", errors="ignore").strip()
+
+
 def _load_syllabi() -> Iterable[Document]:
     """Yield one Document per syllabus file (chunked later)."""
     if not SYLLABI_DIR.exists():
@@ -67,7 +80,7 @@ def _load_syllabi() -> Iterable[Document]:
     for path in sorted(SYLLABI_DIR.iterdir()):
         if path.suffix.lower() not in SUPPORTED_SUFFIXES:
             continue
-        text = path.read_text(encoding="utf-8", errors="ignore").strip()
+        text = _read_file(path)
         if not text:
             continue
         course = _detect_course_code(path.name, text)
@@ -81,40 +94,63 @@ def _load_syllabi() -> Iterable[Document]:
         )
 
 
-def _load_open_alg(per_query_limit: int = 20) -> Iterable[Document]:
-    """Yield one Document per Open ALG project found.
+def _load_openstax() -> Iterable[Document]:
+    """Yield one Document per OpenStax book.
 
-    We seed the search with each required course's discipline so the corpus
-    contains material relevant to the courses we'll query later.
+    OpenStax has ~127 peer-reviewed, CC BY licensed textbooks. Several map
+    directly to GGC required courses (Biology, US History, Intro Computing, etc.).
+    Every book is free for students and faculty with no login required.
     """
-    seeds = sorted({c["discipline"] for c in REQUIRED_COURSES})
-    seeds.extend([c["title"] for c in REQUIRED_COURSES])
-    seen: set[str] = set()
-    for q in seeds:
-        for proj in search_open_alg(q, limit=per_query_limit):
-            pid = proj.get("project_id")
-            if not pid or pid in seen:
-                continue
-            seen.add(pid)
-            blob = "\n".join(filter(None, [
-                proj.get("title", ""),
-                proj.get("subtitle", ""),
-                proj.get("description", ""),
-            ]))
-            if not blob.strip():
-                continue
-            yield Document(
-                page_content=blob,
-                metadata={
-                    "source": "open_alg",
-                    "project_id": str(pid),
-                    "title": proj.get("title", ""),
-                    "url": proj.get("url", ""),
-                    # Open ALG projects are presumed openly licensed by site policy,
-                    # but the LLM should verify per-resource at evaluation time.
-                    "license_hint": "open (presumed by Open ALG site policy)",
-                },
-            )
+    for book in fetch_all_books():
+        title = book.get("title", "")
+        if not title:
+            continue
+        # Build a rich text blob so the embedder has useful signal to work with
+        blob = "\n".join(filter(None, [
+            title,
+            f"Subjects: {book['subjects']}" if book.get("subjects") else "",
+            book.get("description", ""),
+        ]))
+        yield Document(
+            page_content=blob,
+            metadata={
+                "source": "openstax",
+                "title": title,
+                "url": book.get("url", ""),
+                "pdf_url": book.get("pdf_url", ""),
+                # OpenStax books are CC BY — always openly licensed
+                "license_hint": book.get("license", "Creative Commons Attribution License"),
+            },
+        )
+
+
+def _load_open_alg() -> Iterable[Document]:
+    """Yield one Document per project in the full Open ALG catalog.
+
+    Paginates through all pages (~519 projects) rather than keyword-sampling,
+    so every available OER is in the corpus regardless of discipline.
+    """
+    for proj in fetch_all_projects():
+        pid = proj.get("project_id")
+        if not pid:
+            continue
+        blob = "\n".join(filter(None, [
+            proj.get("title", ""),
+            proj.get("subtitle", ""),
+            proj.get("description", ""),
+        ]))
+        if not blob.strip():
+            continue
+        yield Document(
+            page_content=blob,
+            metadata={
+                "source": "open_alg",
+                "project_id": str(pid),
+                "title": proj.get("title", ""),
+                "url": proj.get("url", ""),
+                "license_hint": "open (presumed by Open ALG site policy)",
+            },
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -151,12 +187,15 @@ def run_ingestion() -> dict:
     alg_docs = list(_load_open_alg())
     print(f"[ingest] loaded {len(alg_docs)} Open ALG project(s)")
 
-    all_chunks = _chunk(syllabi_docs + alg_docs)
+    openstax_docs = list(_load_openstax())
+    print(f"[ingest] loaded {len(openstax_docs)} OpenStax book(s)")
+
+    all_chunks = _chunk(syllabi_docs + alg_docs + openstax_docs)
     print(f"[ingest] produced {len(all_chunks)} chunk(s) after splitting")
 
     if not all_chunks:
         log_event("ingest.skip", {"reason": "no documents"})
-        return {"syllabi": 0, "open_alg": 0, "chunks": 0}
+        return {"syllabi": 0, "open_alg": 0, "openstax": 0, "chunks": 0}
 
     ids = [_stable_id(d, i) for i, d in enumerate(all_chunks)]
     store = get_vectorstore()
@@ -165,6 +204,7 @@ def run_ingestion() -> dict:
     stats = {
         "syllabi": len(syllabi_docs),
         "open_alg": len(alg_docs),
+        "openstax": len(openstax_docs),
         "chunks": len(all_chunks),
     }
     log_event("ingest.complete", stats)
