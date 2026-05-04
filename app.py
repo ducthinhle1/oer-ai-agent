@@ -23,7 +23,7 @@ import streamlit as st
 from dotenv import load_dotenv
 
 from agent import evaluated_to_json, run_agent
-from gemini_client import initialize_gemini
+from gemini_client import initialize_gemini, initialize_groq, groq_available
 from ingest import run_ingestion
 from logger import read_log
 from rubric import CRITERIA, SCORE_SCALE, rubric_prompt_block
@@ -37,9 +37,12 @@ from vectorstore import collection_size
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 API_KEY = os.getenv("GOOGLE_API_KEY", "").strip()
-# Streamlit Community Cloud stores secrets in st.secrets (no .env file on cloud)
 if not API_KEY:
     API_KEY = st.secrets.get("GOOGLE_API_KEY", "")
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+if not GROQ_API_KEY:
+    GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", "")
 
 st.set_page_config(
     page_title="OER AI Agent — GGC",
@@ -56,6 +59,8 @@ if not API_KEY:
     st.stop()
 
 initialize_gemini(API_KEY)
+if GROQ_API_KEY:
+    initialize_groq(GROQ_API_KEY)
 
 
 # ---------------------------------------------------------------------------
@@ -72,6 +77,14 @@ with st.sidebar:
         st.warning("No documents indexed yet.\nGo to the **Ingestion** tab first.")
     else:
         st.success(f"**{n_chunks:,}** chunks indexed")
+
+    st.markdown("---")
+    st.markdown("**AI Status**")
+    st.markdown("🟢 Gemini 2.0 Flash (primary)")
+    if groq_available():
+        st.markdown("🟢 Groq Llama 3.3 70B (fallback)")
+    else:
+        st.markdown("⚪ Groq (not configured — add `GROQ_API_KEY`)")
 
     st.markdown("---")
     st.markdown("**How it works**")
