@@ -114,21 +114,32 @@ def _get_reranker():
     return CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
 
-def _retrieve_candidates(query: str, *, top_k: int) -> list[dict]:
+def _retrieve_candidates(query: str, *, top_k: int, course_title: str = "") -> list[dict]:
     """Vector-search Chroma, group chunks by resource, then re-rank.
 
     Pipeline:
-      1. Fast vector search  → top_k chunks (broad recall)
-      2. Group by resource   → N distinct candidates
-      3. Cross-encoder       → re-score each candidate vs. the query
+      1. Dual vector search — AI-refined query + raw course title (broader recall)
+      2. Group by resource  → N distinct candidates (deduped)
+      3. Cross-encoder      → re-score each candidate vs. the query
       4. Return top MAX_CANDIDATES by re-rank score
 
-    Syllabus chunks are included in the vector search (they help pull relevant
-    OER resources to the surface) but are never returned as candidates.
+    Running two searches ensures that highly-relevant resources whose titles
+    match the course name directly are never squeezed out by the AI query alone.
     """
     store = get_vectorstore()
-    # similarity_search_with_score returns (Document, distance) — lower is closer.
-    hits = store.similarity_search_with_score(query, k=top_k)
+    hits_query = store.similarity_search_with_score(query, k=top_k)
+    # Second search with the plain course title catches resources like
+    # "Introduction to Art" that the refined query might rank below the fold.
+    hits_title = store.similarity_search_with_score(course_title, k=top_k // 2) if course_title else []
+    # Merge — keep the best distance when a chunk appears in both searches.
+    seen: dict[str, float] = {}
+    merged = []
+    for doc, dist in hits_query + hits_title:
+        key = doc.page_content[:120]
+        if key not in seen or dist < seen[key]:
+            seen[key] = dist
+            merged.append((doc, dist))
+    hits = merged
 
     grouped: dict[str, dict] = defaultdict(lambda: {
         "title": "", "url": "", "license_hint": "", "source": "",
@@ -350,7 +361,7 @@ def run_agent(
     query = _build_search_query(course_code, course_title, syllabus)
     log_event("search.query", {"course_code": course_code, "query": query})
 
-    candidates = _retrieve_candidates(query, top_k=top_k)
+    candidates = _retrieve_candidates(query, top_k=top_k, course_title=course_title)
     log_event("retrieve.results", {
         "query": query,
         "count": len(candidates),
